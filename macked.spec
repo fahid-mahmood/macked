@@ -47,5 +47,5 @@ app = BUNDLE(
     coll,
     name='Macked.app',
     icon='macked.icns',
-    bundle_identifier='com.yourcompany.macked.v1_0_0',
+    bundle_identifier='com.yourcompany.macked.v1_1_8',
 )

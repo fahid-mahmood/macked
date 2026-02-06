@@ -10,6 +10,7 @@ import random
 import re
 import os
 import json
+from pathlib import Path
 
 # 尝试导入PIL，用于处理图标
 try:
@@ -24,6 +25,9 @@ class ClickableTreeview(ttk.Treeview):
     def __init__(self, master=None, **kw):
         super().__init__(master, **kw)
         self.bind("<ButtonRelease-1>", self.on_click)
+        self.bind("<Control-Button-1>", self.on_ctrl_click)  # Ctrl+左键添加收藏
+        self.favorites = set()  # 存储收藏的软件名称
+        self.log_func = None  # 日志回调函数
         
     def on_click(self, event):
         region = self.identify("region", event.x, event.y)
@@ -38,6 +42,35 @@ class ClickableTreeview(ttk.Treeview):
                     link = values[8]  # 正文链接
                     if link and link.startswith(('http://', 'https://')):
                         webbrowser.open(link)
+    
+    def on_ctrl_click(self, event):
+        """Ctrl+左键添加收藏"""
+        region = self.identify("region", event.x, event.y)
+        if region == "cell":
+            row_id = self.identify_row(event.y)
+            values = self.item(row_id)['values']
+            if values and len(values) > 0:
+                software_name = values[0]  # 软件名称列
+                if software_name in self.favorites:
+                    # 取消收藏
+                    self.favorites.remove(software_name)
+                    # 重新计算标签
+                    tags = []
+                    if 'recent' in self.item(row_id, 'tags'):
+                        tags.append('recent')
+                    self.item(row_id, tags=tuple(tags))
+                    if self.log_func:
+                        self.log_func(f"已取消收藏: {software_name}")
+                else:
+                    # 添加收藏
+                    self.favorites.add(software_name)
+                    # 保留现有的recent标签，同时添加favorite标签
+                    existing_tags = list(self.item(row_id, 'tags'))
+                    if 'favorite' not in existing_tags:
+                        existing_tags.append('favorite')
+                    self.item(row_id, tags=tuple(existing_tags))
+                    if self.log_func:
+                        self.log_func(f"已收藏: {software_name}")
 
 class MackedScraperGUI:
     def __init__(self, root):
@@ -80,9 +113,16 @@ class MackedScraperGUI:
         self.stop_flag = threading.Event()  # 用于停止抓取的标志
         self.software_data_cache = []  # 缓存抓取的数据
         self.all_software_data_cache = []  # 全局缓存所有数据
-        self.config_file = "app_config.json"  # 配置文件
+        self.config_file = self.get_config_path()  # 配置文件路径
         self.load_config()  # 加载配置
         self.setup_ui()
+        
+    def get_config_path(self):
+        """获取配置文件的路径，使用 ~/Library/Application Support/macked/ 目录"""
+        # 创建应用支持目录
+        app_support_dir = Path.home() / 'Library' / 'Application Support' / 'macked'
+        app_support_dir.mkdir(parents=True, exist_ok=True)
+        return app_support_dir / 'app_config.json'
         
     def set_icon(self):
         # 尝试多种方法设置图标
@@ -129,7 +169,7 @@ class MackedScraperGUI:
     def load_config(self):
         """加载配置文件"""
         try:
-            if os.path.exists(self.config_file):
+            if self.config_file.exists():
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                     self.column_widths = config.get('column_widths', {
@@ -144,6 +184,7 @@ class MackedScraperGUI:
                         '正文链接': 205
                     })
                     self.window_size = config.get('window_size', [1000, 700])
+                    self.favorites = set(config.get('favorites', []))  # 加载收藏列表
                 self.root.geometry(f"{self.window_size[0]}x{self.window_size[1]}")
             else:
                 # 默认列宽
@@ -159,6 +200,7 @@ class MackedScraperGUI:
                     '正文链接': 205
                 }
                 self.window_size = [1000, 700]
+                self.favorites = set()  # 初始化为空集合
         except Exception as e:
             print(f"加载配置失败: {e}")
             self.column_widths = {
@@ -173,6 +215,7 @@ class MackedScraperGUI:
                 '正文链接': 205
             }
             self.window_size = [1000, 700]
+            self.favorites = set()
     
     def save_config(self):
         """保存配置文件"""
@@ -186,9 +229,11 @@ class MackedScraperGUI:
             
             config = {
                 'column_widths': self.column_widths,
-                'window_size': self.window_size
+                'window_size': self.window_size,
+                'favorites': list(self.favorites)  # 保存收藏列表
             }
             
+            # 写入配置文件
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -204,13 +249,15 @@ class MackedScraperGUI:
         settings_frame.pack(fill=tk.X, pady=(0, 10))
         
         # 抓取页数设置
-        ttk.Label(settings_frame, text="抓取页数:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        label_pages = ttk.Label(settings_frame, text="抓取页数:")
+        label_pages.grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
         self.pages_var = tk.StringVar(value="3")
         pages_spinbox = ttk.Spinbox(settings_frame, from_=1, to=100, width=10, textvariable=self.pages_var)
         pages_spinbox.grid(row=0, column=1, sticky=tk.W, padx=(0, 20))
         
         # 暂停时间设置
-        ttk.Label(settings_frame, text="页面间暂停时间(秒):").grid(row=0, column=2, sticky=tk.W, padx=(0, 5))
+        label_delay = ttk.Label(settings_frame, text="页面间暂停时间(秒):")
+        label_delay.grid(row=0, column=2, sticky=tk.W, padx=(0, 5))
         self.delay_var = tk.StringVar(value="1")
         delay_spinbox = ttk.Spinbox(settings_frame, from_=1, to=300, width=10, textvariable=self.delay_var)
         delay_spinbox.grid(row=0, column=3, sticky=tk.W, padx=(0, 20))
@@ -235,7 +282,9 @@ class MackedScraperGUI:
         
         # 创建可点击链接的Treeview
         columns = ("软件名称", "软件版本", "简介", "更新时间", "评论数", "浏览量", "点赞量", "破解方式", "正文链接")
-        self.tree = ClickableTreeview(table_frame, columns=columns, show="headings", height=20)  # 增加了height值
+        self.tree = ClickableTreeview(table_frame, columns=columns, show="headings", height=15)  # 减少高度值以平衡布局
+        self.tree.favorites = self.favorites  # 将收藏列表传递给Treeview
+        self.tree.log_func = self.log_message  # 设置日志回调函数
         
         # 设置列标题和宽度
         for col in columns:
@@ -264,7 +313,7 @@ class MackedScraperGUI:
         status_frame = ttk.LabelFrame(main_frame, text="执行日志", padding=5)
         status_frame.pack(fill=tk.X, expand=False)  # 改为fill=tk.X, expand=False
         
-        self.log_text = scrolledtext.ScrolledText(status_frame, height=4, state=tk.DISABLED)  # 从8改为4
+        self.log_text = scrolledtext.ScrolledText(status_frame, height=6, state=tk.DISABLED)  # 增加日志区高度
         self.log_text.pack(fill=tk.X)  # 改为fill=tk.X
         
         # 进度条
@@ -274,7 +323,15 @@ class MackedScraperGUI:
         # 初始化样式
         style = ttk.Style()
         style.configure("Green.Treeview", foreground="green")
-        
+        style.configure("Blue.Treeview", foreground="blue")  # 新增蓝色样式
+        style.configure("Treeview", font=("TkDefaultFont", 14), rowheight=25)  # 设置表格字体和行高
+        style.configure("Treeview.Heading", font=("TkDefaultFont", 14))  # 设置表头字体
+        style.configure("TLabel", font=("TkDefaultFont", 14))  # 设置标签字体
+        style.configure("TButton", font=("TkDefaultFont", 14))  # 设置按钮字体
+        style.configure("TCheckbutton", font=("TkDefaultFont", 14))  # 设置复选框字体
+        style.configure("TSpinbox", font=("TkDefaultFont", 14))  # 设置微调框字体
+        style.configure("TLabelFrame.Label", font=("TkDefaultFont", 14))  # 设置标签框标题字体
+    
     def on_column_resize(self, event):
         """监听列宽改变事件"""
         # 使用定时器延迟保存，避免频繁保存
@@ -330,7 +387,7 @@ class MackedScraperGUI:
         for index, (_, child) in enumerate(data):
             self.tree.move(child, '', index)
         
-        # 更新颜色
+        # 排序后重新应用颜色标签
         self.update_time_colors()
     
     def auto_sort_by_time(self):
@@ -376,7 +433,7 @@ class MackedScraperGUI:
         for index, (_, child) in enumerate(data):
             self.tree.move(child, '', index)
         
-        # 更新颜色
+        # 排序后重新应用颜色标签
         self.update_time_colors()
     
     def update_time_colors(self):
@@ -385,20 +442,28 @@ class MackedScraperGUI:
             values = self.tree.item(item)['values']
             if values and len(values) > 3:  # 确保有更新时间列
                 update_time_str = values[3]  # 更新时间列
+                software_name = values[0]  # 软件名称列
                 
                 # 解析时间
                 parsed_time = self.parse_datetime(update_time_str)
                 current_time = datetime.now()
                 time_diff = current_time - parsed_time
                 
-                # 如果在24小时内，设为绿色
-                if time_diff <= timedelta(hours=24):
-                    self.tree.item(item, tags=('recent',))
-                else:
-                    self.tree.item(item, tags=())
+                # 准备标签列表
+                tags = []
+                
+                # 优先检查是否是收藏的软件
+                if software_name in self.favorites:
+                    tags.append('favorite')  # 收藏优先
+                elif time_diff <= timedelta(hours=24):
+                    tags.append('recent')  # 仅当不是收藏时才显示为24小时内
+                
+                # 应用标签
+                self.tree.item(item, tags=tuple(tags))
         
         # 配置样式
         self.tree.tag_configure('recent', foreground='green')
+        self.tree.tag_configure('favorite', foreground='blue')
     
     def parse_datetime(self, date_str):
         """解析日期时间字符串，转换为datetime对象"""
@@ -537,9 +602,13 @@ class MackedScraperGUI:
                 )
                 item_id = self.tree.insert("", tk.END, values=values)
                 
-                # 设置颜色
-                if time_diff <= timedelta(hours=24):
-                    self.tree.item(item_id, tags=('recent',))
+                # 设置颜色标签 - 收藏优先
+                tags = []
+                if software["软件名称"] in self.favorites:
+                    tags.append('favorite')  # 收藏优先
+                else:
+                    tags.append('recent')  # 24小时内
+                self.tree.item(item_id, tags=tuple(tags))
     
     def show_all_cached_data(self):
         """显示所有缓存的数据"""
@@ -562,20 +631,26 @@ class MackedScraperGUI:
             )
             item_id = self.tree.insert("", tk.END, values=values)
             
-            # 检查是否在24小时内，设置颜色
+            # 设置颜色标签 - 收藏优先
+            tags = []
+            # 检查是否在24小时内
             update_time = software["更新时间"]
             parsed_time = self.parse_datetime(update_time)
             current_time = datetime.now()
             time_diff = current_time - parsed_time
             
-            if time_diff <= timedelta(hours=24):
-                self.tree.item(item_id, tags=('recent',))
+            if software["软件名称"] in self.favorites:
+                tags.append('favorite')  # 收藏优先
+            elif time_diff <= timedelta(hours=24):
+                tags.append('recent')  # 仅当不是收藏时才显示为24小时内
+            
+            self.tree.item(item_id, tags=tuple(tags))
     
     def fetch_webpage(self, url):
         """发送请求获取网页内容"""
         try:
             # 随机延迟，避免频繁请求被封
-            delay = random.uniform(10, 30)
+            delay = random.uniform(5, 10)
             self.log_message(f"等待 {delay:.1f} 秒后请求页面...")
             time.sleep(delay)
             
@@ -765,21 +840,31 @@ class MackedScraperGUI:
                     if time_diff <= timedelta(hours=24):
                         item_id = self.tree.insert("", tk.END, values=values)
                         
-                        # 检查是否在24小时内，设置颜色
-                        if time_diff <= timedelta(hours=24):
-                            self.tree.item(item_id, tags=('recent',))
+                        # 设置颜色标签 - 收藏优先
+                        tags = []
+                        if software["软件名称"] in self.favorites:
+                            tags.append('favorite')  # 收藏优先
+                        else:
+                            tags.append('recent')  # 24小时内
+                        self.tree.item(item_id, tags=tuple(tags))
                 else:
                     # 不过滤，直接添加
                     item_id = self.tree.insert("", tk.END, values=values)
                     
-                    # 检查是否在24小时内，设置颜色
+                    # 计算时间差，用于标签设置
                     update_time = software["更新时间"]
                     parsed_time = self.parse_datetime(update_time)
                     current_time = datetime.now()
                     time_diff = current_time - parsed_time
                     
-                    if time_diff <= timedelta(hours=24):
-                        self.tree.item(item_id, tags=('recent',))
+                    # 设置颜色标签 - 收藏优先
+                    tags = []
+                    if software["软件名称"] in self.favorites:
+                        tags.append('favorite')  # 收藏优先
+                    elif time_diff <= timedelta(hours=24):
+                        tags.append('recent')  # 仅当不是收藏时才显示为24小时内
+                    
+                    self.tree.item(item_id, tags=tuple(tags))
             
             # 将当前页面数据添加到全局缓存
             self.all_software_data_cache.extend(page_data)
