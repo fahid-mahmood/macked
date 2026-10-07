@@ -7,6 +7,7 @@ cd "$DIR"
 if [ ! -d .venv ]; then
     python3 -m venv .venv || { osascript -e 'display notification "Failed to create virtualenv. Is Python installed?" with title "Macked"'; exit 1; }
     .venv/bin/pip install --quiet -r requirements.txt
+    .venv/bin/playwright install chromium || true
 fi
 
 exec .venv/bin/python macked.py

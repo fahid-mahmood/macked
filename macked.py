@@ -20,6 +20,24 @@ except ImportError:
     PIL_AVAILABLE = False
     print("Note: PIL is not installed, icon support may be limited")
 
+# curl_cffi impersonates a real browser's TLS fingerprint, which Cloudflare
+# accepts far more often than plain requests (plain requests gets 403 at times)
+try:
+    from curl_cffi import requests as curl_requests
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    CURL_CFFI_AVAILABLE = False
+    print("Note: curl_cffi is not installed, falling back to plain requests "
+          "(more likely to be blocked by Cloudflare). Install with: pip install curl_cffi")
+
+# playwright drives a real Chromium engine, used as the fallback when
+# Cloudflare insists on a challenge that plain HTTP cannot pass
+try:
+    from playwright.sync_api import sync_playwright, Error as PlaywrightError
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
 # Column key mapping for older config files that used Chinese column names
 LEGACY_COLUMN_KEYS = {
     '软件名称': 'Name',
@@ -139,6 +157,9 @@ class MackedScraperGUI:
         self.stop_flag = threading.Event()  # flag used to stop scraping
         self.software_data_cache = []  # cached scraped data
         self.all_software_data_cache = []  # global cache of all data
+        # HTTP session with a browser-like fingerprint; keeps cookies
+        # (including any Cloudflare clearance) across pages
+        self.http = curl_requests.Session(impersonate="chrome") if CURL_CFFI_AVAILABLE else None
         self.config_file = self.get_config_path()  # config file path
         self.load_config()  # load configuration
         self.setup_ui()
@@ -498,13 +519,15 @@ class MackedScraperGUI:
         return datetime.now()
 
     def log_message(self, message):
-        """Append a message to the log box"""
-        self.log_text.config(state=tk.NORMAL)
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.log_text.see(tk.END)
-        self.log_text.config(state=tk.DISABLED)
-        self.root.update_idletasks()
+        """Append a message to the log box (safe to call from any thread)"""
+        def append():
+            self.log_text.config(state=tk.NORMAL)
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+            self.log_text.see(tk.END)
+            self.log_text.config(state=tk.DISABLED)
+        # Tkinter widgets must only be touched from the main thread
+        self.root.after(0, append)
 
     def generate_random_headers(self):
         """Generate random request headers, different for every request"""
@@ -645,30 +668,127 @@ class MackedScraperGUI:
 
             self.tree.item(item_id, tags=tuple(tags))
 
-    def fetch_webpage(self, url):
-        """Send a request and return the page content"""
-        try:
-            # Random delay to avoid being blocked for rapid requests
-            delay = random.uniform(5, 10)
-            self.log_message(f"Waiting {delay:.1f}s before requesting the page...")
-            time.sleep(delay)
+    @staticmethod
+    def is_challenge(text):
+        """Detect a Cloudflare challenge page (often served with HTTP 200)"""
+        return bool(text) and ("Just a moment" in text or "challenge-platform" in text)
+
+    def fetch_with_browser(self, url):
+        """Fetch using a real Chromium engine (last resort against Cloudflare).
+
+        Tries headless first - modern managed challenges often clear on their
+        own. If not, opens a visible window so the user can complete the
+        human verification once; the clearance cookies are stored in a
+        persistent profile and reused for later requests.
+        """
+        if not PLAYWRIGHT_AVAILABLE:
+            self.log_message("Blocked by Cloudflare and playwright is not installed. "
+                             "Fix: pip install playwright && playwright install chromium")
+            return None
+        profile_dir = Path.home() / 'Library' / 'Application Support' / 'macked' / 'browser-profile'
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        with sync_playwright() as p:
+            for headless in (True, False):
+                if self.stop_flag.is_set():
+                    return None
+                context = None
+                try:
+                    context = p.chromium.launch_persistent_context(
+                        str(profile_dir), headless=headless,
+                        viewport={"width": 1280, "height": 800})
+                    page = context.pages[0] if context.pages else context.new_page()
+                    page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                    if not headless:
+                        self.log_message("Cloudflare needs human verification - please complete "
+                                         "the check in the browser window that just opened...")
+                    deadline = time.time() + (20 if headless else 150)
+                    html = page.content()
+                    while self.is_challenge(html) and time.time() < deadline:
+                        if self.stop_flag.is_set():
+                            break
+                        time.sleep(1)
+                        html = page.content()
+                    if not self.is_challenge(html):
+                        # Carry the clearance cookies over to the fast HTTP path
+                        try:
+                            for c in context.cookies():
+                                self.http.cookies.set(c["name"], c["value"],
+                                                      domain=c.get("domain") or ".macked.app")
+                        except Exception:
+                            pass
+                        self.log_message("Browser fetch succeeded"
+                                         + (" (verification complete)" if not headless else ""))
+                        return html
+                except PlaywrightError as e:
+                    msg = str(e).splitlines()[0]
+                    self.log_message(f"Browser fetch error: {msg}")
+                    if "Executable doesn't exist" in str(e):
+                        self.log_message("Chromium is missing. Run once: "
+                                         ".venv/bin/playwright install chromium")
+                        return None
+                except Exception as e:
+                    self.log_message(f"Browser fetch error: {e}")
+                finally:
+                    if context is not None:
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+        return None
+
+    def fetch_webpage(self, url, first_page=True):
+        """Send a request and return the page content.
+
+        Layered strategy: fast impersonated HTTP first; when Cloudflare
+        insists on a challenge, fall back to a real browser engine.
+        """
+        last_error = "unknown error"
+        challenged = False
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            # Politeness delay before the first request for a page
+            if first_page and attempt == 1:
+                delay = random.uniform(3, 6)
+                self.log_message(f"Waiting {delay:.1f}s before requesting the page...")
+                time.sleep(delay)
 
             # Check whether we should stop
             if self.stop_flag.is_set():
                 return None
 
-            # Use random headers for every request
-            headers = self.generate_random_headers()
+            try:
+                if self.http is not None:
+                    response = self.http.get(url, timeout=20)
+                    status, text = response.status_code, response.text
+                else:
+                    headers = self.generate_random_headers()
+                    response = requests.get(url, headers=headers, timeout=20)
+                    response.raise_for_status()
+                    response.encoding = response.apparent_encoding
+                    status, text = response.status_code, response.text
 
-            response = requests.get(url, headers=headers, timeout=15, verify=False)
-            # Check the response status code
-            response.raise_for_status()
-            # Set the correct encoding (avoid mojibake)
-            response.encoding = response.apparent_encoding
-            return response.text
-        except requests.exceptions.RequestException as e:
-            self.log_message(f"Request failed: {e}")
-            return None
+                if status == 200 and not self.is_challenge(text):
+                    return text
+                challenge = self.is_challenge(text)
+                challenged = challenged or challenge
+                last_error = f"HTTP {status}" + (" (Cloudflare challenge)" if challenge else "")
+            except requests.exceptions.RequestException as e:
+                last_error = str(e)
+            except Exception as e:
+                last_error = str(e)
+
+            if attempt < max_attempts:
+                wait = random.uniform(2, 4) * attempt
+                self.log_message(f"Blocked ({last_error}); retrying in {wait:.0f}s "
+                                 f"(attempt {attempt + 1}/{max_attempts})...")
+                time.sleep(wait)
+
+        if challenged:
+            self.log_message("HTTP requests keep getting challenged, switching to a real browser...")
+            return self.fetch_with_browser(url)
+
+        self.log_message(f"Request failed after {max_attempts} attempts: {last_error}")
+        return None
 
     def parse_software_list(self, html_text):
         """Parse page HTML and extract the software list"""
@@ -796,8 +916,7 @@ class MackedScraperGUI:
 
             # Update the progress bar
             progress_value = (page_num - 1) / total_pages * 100
-            self.progress['value'] = progress_value
-            self.root.update_idletasks()
+            self.root.after(0, lambda v=progress_value: self.progress.configure(value=v))
 
             # Check whether we should stop
             if self.stop_flag.is_set():
@@ -816,54 +935,59 @@ class MackedScraperGUI:
             # Cache the data
             all_software_data.extend(page_data)
 
-            # Add the current page's data to the table
-            for software in page_data:
-                values = (
-                    software["Name"],
-                    software["Version"],
-                    software["Description"],
-                    software["Updated"],
-                    software["Comments"],
-                    software["Views"],
-                    software["Likes"],
-                    software["Activation"],
-                    software["Link"]
-                )
-                # If the last-24h filter is on, only show matching rows
-                if self.show_recent_only_var.get():
-                    update_time = software["Updated"]
-                    parsed_time = self.parse_datetime(update_time)
-                    current_time = datetime.now()
-                    time_diff = current_time - parsed_time
+            # Add the current page's data to the table.
+            # Widgets are touched on the main thread via after(), since this
+            # method runs in the scraping thread.
+            def add_rows(page_data=page_data):
+                recent_only = self.show_recent_only_var.get()
+                for software in page_data:
+                    values = (
+                        software["Name"],
+                        software["Version"],
+                        software["Description"],
+                        software["Updated"],
+                        software["Comments"],
+                        software["Views"],
+                        software["Likes"],
+                        software["Activation"],
+                        software["Link"]
+                    )
+                    # If the last-24h filter is on, only show matching rows
+                    if recent_only:
+                        update_time = software["Updated"]
+                        parsed_time = self.parse_datetime(update_time)
+                        current_time = datetime.now()
+                        time_diff = current_time - parsed_time
 
-                    if time_diff <= timedelta(hours=24):
+                        if time_diff <= timedelta(hours=24):
+                            item_id = self.tree.insert("", tk.END, values=values)
+
+                            # Set color tags - favorites win
+                            tags = []
+                            if software["Name"] in self.favorites:
+                                tags.append('favorite')  # favorite wins
+                            else:
+                                tags.append('recent')  # within 24 hours
+                            self.tree.item(item_id, tags=tuple(tags))
+                    else:
+                        # No filter, add directly
                         item_id = self.tree.insert("", tk.END, values=values)
+
+                        # Compute the time difference for tag assignment
+                        update_time = software["Updated"]
+                        parsed_time = self.parse_datetime(update_time)
+                        current_time = datetime.now()
+                        time_diff = current_time - parsed_time
 
                         # Set color tags - favorites win
                         tags = []
                         if software["Name"] in self.favorites:
                             tags.append('favorite')  # favorite wins
-                        else:
-                            tags.append('recent')  # within 24 hours
+                        elif time_diff <= timedelta(hours=24):
+                            tags.append('recent')  # only show as recent when not a favorite
+
                         self.tree.item(item_id, tags=tuple(tags))
-                else:
-                    # No filter, add directly
-                    item_id = self.tree.insert("", tk.END, values=values)
-
-                    # Compute the time difference for tag assignment
-                    update_time = software["Updated"]
-                    parsed_time = self.parse_datetime(update_time)
-                    current_time = datetime.now()
-                    time_diff = current_time - parsed_time
-
-                    # Set color tags - favorites win
-                    tags = []
-                    if software["Name"] in self.favorites:
-                        tags.append('favorite')  # favorite wins
-                    elif time_diff <= timedelta(hours=24):
-                        tags.append('recent')  # only show as recent when not a favorite
-
-                    self.tree.item(item_id, tags=tuple(tags))
+            self.root.after(0, add_rows)
 
             # Add the current page's data to the global cache
             self.all_software_data_cache.extend(page_data)
@@ -900,7 +1024,7 @@ class MackedScraperGUI:
                 break
 
         # Finish the progress bar
-        self.progress['value'] = 100
+        self.root.after(0, lambda: self.progress.configure(value=100))
         return all_software_data
 
     def start_scraping(self):
@@ -943,20 +1067,23 @@ class MackedScraperGUI:
                     self.all_software_data_cache = software_data
 
                     self.log_message(f"Scrape complete! Extracted {len(software_data)} items")
-                    # Auto-sort by time after scraping
-                    self.auto_sort_by_time()
 
-                    # Apply the filter according to the checkbox
-                    if self.show_recent_only_var.get():
-                        self.apply_time_filter()
+                    # Auto-sort by time, then apply the filter, on the main thread
+                    def finish_up():
+                        self.auto_sort_by_time()
+                        if self.show_recent_only_var.get():
+                            self.apply_time_filter()
+                    self.root.after(0, finish_up)
 
             except Exception as e:
                 self.log_message(f"Error during scraping: {e}")
             finally:
                 # Re-enable Start, disable Stop
-                self.start_btn.config(state=tk.NORMAL)
-                self.stop_btn.config(state=tk.DISABLED)
-                self.progress['value'] = 0
+                def reset_buttons():
+                    self.start_btn.config(state=tk.NORMAL)
+                    self.stop_btn.config(state=tk.DISABLED)
+                    self.progress['value'] = 0
+                self.root.after(0, reset_buttons)
 
         # Start the scraping thread
         thread = threading.Thread(target=scraping_task)
@@ -997,8 +1124,4 @@ def main():
     root.mainloop()
 
 if __name__ == "__main__":
-    # Disable SSL warnings to avoid noise from verify=False requests
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
     main()
